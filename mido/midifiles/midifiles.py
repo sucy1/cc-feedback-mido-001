@@ -19,6 +19,7 @@ http://www.recordingblogs.com/sa/tabid/82/EntryId/44/MIDI-Part-XIII-Delta-time-a
 http://www.sonicspot.com/guide/midifiles.html
 """
 
+import io
 import string
 import struct
 import time
@@ -36,6 +37,10 @@ DEFAULT_TICKS_PER_BEAT = 480
 
 # Maximum message length to attempt to read.
 MAX_MESSAGE_LENGTH = 1000000
+
+# SMPTE frame rates allowed in the time division. (29 is 29.97
+# drop-frame, stored as -29 in the file.)
+SMPTE_FRAME_RATES = (24, 25, 29, 30)
 
 
 def print_byte(byte, pos=0):
@@ -111,6 +116,73 @@ def read_file_header(infile):
             raise EOFError
 
         return struct.unpack('>hhh', data[:6])
+
+
+class _PrefixedReader:
+    """File-like object that serves `prefix` before the wrapped file.
+
+    Used to push back bytes consumed while sniffing the file type.
+    Only the methods used by the MIDI file reader are implemented.
+    """
+
+    def __init__(self, prefix, infile):
+        self._prefix = prefix
+        self._infile = infile
+        self._pos = 0
+
+    def read(self, size):
+        if self._pos < len(self._prefix):
+            end = min(self._pos + size, len(self._prefix))
+            data = self._prefix[self._pos:end]
+            self._pos = end
+            rest = size - len(data)
+            if rest:
+                chunk = self._infile.read(rest)
+                self._pos += len(chunk)
+                data += chunk
+            return data
+
+        data = self._infile.read(size)
+        self._pos += len(data)
+        return data
+
+    def tell(self):
+        return self._pos
+
+
+def read_riff_data(infile):
+    """Read the 'data' chunk of a RIFF RMID file.
+
+    The 'RIFF' tag must already have been consumed. Returns a file-like
+    object positioned at the start of the embedded MIDI file.
+    """
+    header = infile.read(8)
+    if len(header) < 8:
+        raise EOFError
+
+    _, form = struct.unpack('<L4s', header)
+    if form != b'RMID':
+        raise OSError(f'not a RIFF MIDI file (form type {form!r})')
+
+    while True:
+        chunk_header = infile.read(8)
+        if len(chunk_header) < 8:
+            raise OSError('no data chunk found in RIFF MIDI file')
+
+        name, size = struct.unpack('<4sL', chunk_header)
+        if name == b'data':
+            data = infile.read(size)
+            if len(data) < size:
+                raise EOFError
+            return io.BytesIO(data)
+
+        # Skip unknown chunk. Chunks are padded to even sizes.
+        remaining = size + (size & 1)
+        while remaining > 0:
+            skipped = infile.read(min(remaining, 8192))
+            if not skipped:
+                raise OSError('no data chunk found in RIFF MIDI file')
+            remaining -= len(skipped)
 
 
 def read_message(infile, status_byte, peek_data, delta, clip=False):
@@ -300,9 +372,12 @@ class MidiFile:
         self.filename = filename
         self.type = type
         self.ticks_per_beat = ticks_per_beat
+        self.smpte_fps = None
+        self.smpte_ticks_per_frame = None
         self.charset = charset
         self.debug = debug
         self.clip = clip
+        self._riff_wrapped = False
 
         self.tracks = []
         self._merged_track = None
@@ -351,13 +426,47 @@ class MidiFile:
         if self.debug:
             infile = DebugFileWrapper(infile)
 
+        # An .rmi file is a standard MIDI file wrapped in a RIFF
+        # container. Sniff the first 4 bytes and unwrap if needed.
+        magic = infile.read(4)
+        if magic == b'RIFF':
+            infile = read_riff_data(infile)
+            self._riff_wrapped = True
+        else:
+            infile = _PrefixedReader(magic, infile)
+
         with meta_charset(self.charset):
             if self.debug:
                 _dbg('Header:')
 
             (self.type,
              num_tracks,
-             self.ticks_per_beat) = read_file_header(infile)
+             division) = read_file_header(infile)
+
+            if division < 0:
+                # SMPTE time division: the high byte is the negative
+                # frame rate and the low byte is ticks per frame.
+                fps = 256 - ((division >> 8) & 0xff)
+                ticks_per_frame = division & 0xff
+
+                if fps not in SMPTE_FRAME_RATES:
+                    raise OSError(
+                        f'invalid SMPTE frame rate {fps} in time division'
+                        f' (must be one of {SMPTE_FRAME_RATES})')
+                if ticks_per_frame < 1:
+                    raise OSError(
+                        'invalid SMPTE time division:'
+                        f' ticks per frame must be >= 1,'
+                        f' got {ticks_per_frame}')
+
+                self.smpte_fps = fps
+                self.smpte_ticks_per_frame = ticks_per_frame
+                # Ticks per beat is meaningless for SMPTE files.
+                self.ticks_per_beat = None
+            else:
+                self.smpte_fps = None
+                self.smpte_ticks_per_frame = None
+                self.ticks_per_beat = division
 
             if self.debug:
                 _dbg('-> type={}, tracks={}, ticks_per_beat={}'.format(
@@ -387,6 +496,20 @@ class MidiFile:
         return sum(msg.time for msg in self)
 
     def __iter__(self):
+        if self.smpte_fps is not None:
+            # SMPTE time division: ticks are wall-clock units, so the
+            # tempo map does not apply.
+            seconds_per_tick = 1.0 / (self.smpte_fps
+                                      * self.smpte_ticks_per_frame)
+            for msg in self.merged_track:
+                if msg.time > 0:
+                    delta = msg.time * seconds_per_tick
+                else:
+                    delta = 0
+
+                yield msg.copy(skip_checks=True, time=delta)
+            return
+
         tempo = DEFAULT_TEMPO
         for msg in self.merged_track:
             # Convert message time from absolute time
@@ -460,10 +583,43 @@ class MidiFile:
             raise ValueError('requires filename or file')
 
     def _save(self, outfile):
+        if self._riff_wrapped:
+            # The file was read from an .rmi file, so write it back
+            # as a RIFF RMID container.
+            buffer = io.BytesIO()
+            self._save_smf(buffer)
+            data = buffer.getvalue()
+
+            # RIFF chunk sizes are little endian. The RIFF size covers
+            # everything after the size field itself, including the
+            # pad byte that rounds the data chunk up to an even size.
+            riff_size = 4 + 8 + len(data) + (len(data) & 1)
+            outfile.write(b'RIFF')
+            outfile.write(struct.pack('<L', riff_size))
+            outfile.write(b'RMID')
+            outfile.write(b'data')
+            outfile.write(struct.pack('<L', len(data)))
+            outfile.write(data)
+            if len(data) & 1:
+                outfile.write(b'\x00')
+        else:
+            self._save_smf(outfile)
+
+    def _save_smf(self, outfile):
         with meta_charset(self.charset):
+            if self.smpte_fps is not None:
+                # SMPTE time division: negative frame rate in the high
+                # byte, ticks per frame in the low byte.
+                division = (((-self.smpte_fps) & 0xff) << 8
+                            | self.smpte_ticks_per_frame)
+                # struct packs a signed short, so convert back.
+                division -= 0x10000
+            else:
+                division = self.ticks_per_beat
+
             header = struct.pack('>hhh', self.type,
                                  len(self.tracks),
-                                 self.ticks_per_beat)
+                                 division)
 
             write_chunk(outfile, b'MThd', header)
 
