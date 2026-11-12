@@ -68,7 +68,7 @@ lint-reuse = ['reuse~=1.1.2',]
 ports-pygame = ['PyGame~=2.5',]
 ports-rtmidi = ['python-rtmidi~=1.5.4',]
 ports-rtmidi-python = ['rtmidi-python~=0.2.2',]
-release = ['twine~=4.0.2',]
+release = ['twine>=4.0.2,<7.1.0',]
 test-code = ['pytest~=7.4.0',]
 test-coverage = ['coverage~=7.13.5', 'mido[test-code]']
 
