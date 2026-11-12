@@ -63,7 +63,7 @@ build-docs = [
     'sphinx-rtd-theme>=1.3',
 ]
 check-manifest = ['check-manifest>=0.49',]
-lint-code = ['ruff~=0.1.6',]
+lint-code = ['ruff>=0.1.6,<0.18.0',]
 lint-reuse = ['reuse~=1.1.2',]
 ports-pygame = ['PyGame~=2.5',]
 ports-rtmidi = ['python-rtmidi~=1.5.4',]
