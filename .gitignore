@@ -23,3 +23,5 @@ docs/_build
 # Coverage output
 coverage.xml
 htmlcov/
+# 本地凭据
+.env
