@@ -1,0 +1,5 @@
+来源仓库：https://github.com/mido/mido
+冻结 commit：d261ee41db32717fb73dfaa14162159fb6529ef5
+许可证：MIT
+导入日期：2026-11-12
+说明：本目录为评测底座，已剥离上游 git 历史，仅保留代码快照。
